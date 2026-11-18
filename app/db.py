@@ -8,8 +8,23 @@ from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
 SCHEMA = """
+-- One row per uploaded batch.  ``file_id`` is the id returned by the upload
+-- endpoint and never changes: erasure rewrites create new file versions, but
+-- every version stays bound to its original batch id.  ``state`` controls
+-- whether the batch is included when serving downloads.
+CREATE TABLE IF NOT EXISTS batches (
+    file_id     TEXT PRIMARY KEY,
+    date        TEXT NOT NULL,
+    state       TEXT NOT NULL CHECK (state IN ('active', 'quarantined')),
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    released_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_batches_date ON batches(date, state);
+
 CREATE TABLE IF NOT EXISTS files (
     file_id    TEXT PRIMARY KEY,
+    batch_id   TEXT NOT NULL,                 -- original upload id of this batch
     date       TEXT NOT NULL,
     path       TEXT NOT NULL,
     rows       INTEGER NOT NULL,
@@ -74,6 +89,36 @@ class StateStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._migrate()
+            # created after migration: the column does not exist in old databases
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_files_batch ON files(batch_id, status)"
+            )
+
+    def _migrate(self) -> None:
+        """Upgrade state databases created before batch isolation existed.
+
+        Every pre-existing part file (including versions produced by erasure
+        rewrites) belongs to the batch whose id is its file id, so that is the
+        only possible reconstruction: ``file_id`` identifies the upload.
+        """
+        columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(files)")}
+        if "batch_id" in columns:
+            return
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "ALTER TABLE files ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.execute("UPDATE files SET batch_id=file_id")
+            self._conn.execute(
+                "INSERT OR IGNORE INTO batches(file_id, date, state, created_at, updated_at)"
+                " SELECT file_id, date, 'active', created_at, created_at FROM files"
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     def close(self) -> None:
         with self._lock:
@@ -103,12 +148,19 @@ class StateStore:
 
     def record_upload(self, file_id: str, date: str, path: str, rows: int,
                       user_ids: Iterable[str]) -> None:
+        """Register a new upload batch atomically.  ``file_id`` is both the
+        batch id returned to the caller and the id of the first file version."""
         now = utcnow()
         with self.transaction() as conn:
             conn.execute(
-                "INSERT INTO files(file_id, date, path, rows, status, created_at)"
-                " VALUES (?,?,?,?,'active',?)",
-                (file_id, date, path, rows, now),
+                "INSERT INTO batches(file_id, date, state, created_at, updated_at)"
+                " VALUES (?,?,'active',?,?)",
+                (file_id, date, now, now),
+            )
+            conn.execute(
+                "INSERT INTO files(file_id, batch_id, date, path, rows, status, created_at)"
+                " VALUES (?,?,?,?,?,'active',?)",
+                (file_id, file_id, date, path, rows, now),
             )
             conn.executemany(
                 "INSERT OR IGNORE INTO user_dates(user_id, date) VALUES (?,?)",
@@ -119,8 +171,12 @@ class StateStore:
         return self.query_one("SELECT * FROM files WHERE file_id=?", (file_id,))
 
     def active_files_for_date(self, date: str) -> list[sqlite3.Row]:
+        """Active file versions of one day that are served for downloads.
+        Quarantined batches are excluded; erasure uses the unfiltered helpers."""
         return self.query(
-            "SELECT * FROM files WHERE date=? AND status='active' ORDER BY created_at",
+            "SELECT f.* FROM files f JOIN batches b ON b.file_id=f.batch_id"
+            " WHERE f.date=? AND f.status='active' AND b.state='active'"
+            " ORDER BY f.created_at",
             (date,),
         )
 
@@ -132,6 +188,54 @@ class StateStore:
             f"SELECT * FROM files WHERE status='active' AND date IN ({marks})",
             tuple(dates),
         )
+
+    # -------------------------------------------------------------- batches
+
+    def get_batch(self, file_id: str) -> Optional[sqlite3.Row]:
+        return self.query_one("SELECT * FROM batches WHERE file_id=?", (file_id,))
+
+    def batch_state(self, file_id: str) -> Optional[str]:
+        row = self.query_one("SELECT state FROM batches WHERE file_id=?", (file_id,))
+        return None if row is None else row["state"]
+
+    def quarantine_batch(self, file_id: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE batches SET state='quarantined', updated_at=?, released_at=NULL"
+                " WHERE file_id=?",
+                (utcnow(), file_id),
+            )
+
+    def release_batch(self, file_id: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE batches SET state='active', updated_at=?, released_at=?"
+                " WHERE file_id=?",
+                (utcnow(), utcnow(), file_id),
+            )
+
+    def release_blockers(self, file_id: str) -> list[str]:
+        """Task ids whose erasure touches the batch and has not completed yet.
+
+        Releasing such a batch could serve erased clicks or data that a
+        running/failed erasure still has to rewrite, so release must be
+        refused while any exists.  A task is only a blocker when its snapshot
+        really contains a file version of this batch — including versions
+        already processed, because until the task is ``completed`` its final
+        verification sweep may still re-queue them.
+        """
+        return [
+            r["task_id"]
+            for r in self.query(
+                "SELECT DISTINCT t.task_id FROM erasure_tasks t"
+                " JOIN erasure_files ef ON ef.task_id=t.task_id"
+                " JOIN files f ON f.file_id=ef.file_id"
+                " WHERE t.status != 'completed' AND f.batch_id=?"
+                " ORDER BY t.created_at",
+                (file_id,),
+            )
+        ]
+
 
     def files_with_status(self, *statuses: str) -> list[sqlite3.Row]:
         marks = ",".join("?" for _ in statuses)
@@ -146,10 +250,11 @@ class StateStore:
 
     # -------------------------------------------------------- erasure tasks
 
-    def accept_task(self, task_id: str, user_id: str) -> None:
-        """Create the task, snapshot every active file that may hold the user's
-        data and restrict the affected dates — atomically. Runs under the
-        service commit lock, so no upload can slip in between."""
+    def accept_task(self, task_id: str, user_id: str,
+                    file_ids: Iterable[str]) -> None:
+        """Create the task, snapshot the files that actually hold the user's
+        rows and restrict the affected dates — atomically.  Running under the
+        service commit lock, no upload can slip in between."""
         now = utcnow()
         with self.transaction() as conn:
             conn.execute(
@@ -157,12 +262,10 @@ class StateStore:
                 " VALUES (?,?,'pending',0,?,?)",
                 (task_id, user_id, now, now),
             )
-            conn.execute(
+            conn.executemany(
                 "INSERT OR IGNORE INTO erasure_files(task_id, file_id, status)"
-                " SELECT ?, file_id, 'pending' FROM files"
-                " WHERE status='active' AND date IN"
-                "       (SELECT date FROM user_dates WHERE user_id=?)",
-                (task_id, user_id),
+                " VALUES (?,?,'pending')",
+                [(task_id, f) for f in file_ids],
             )
             conn.execute(
                 "INSERT OR IGNORE INTO restricted_dates(date, task_id)"
@@ -236,13 +339,22 @@ class StateStore:
                        date: str, path: str, rows: int) -> None:
         """Atomically register the replacement file, retire the old one and
         re-point every *other* task's pending rows at the new file, so
-        overlapping erasures never lose track of data they still must remove."""
+        overlapping erasures never lose track of data they still must remove.
+
+        The new version inherits the old file's ``batch_id``: quarantine and
+        release keep addressing the batch by the id returned at upload time,
+        no matter how often erasure rewrites it.
+        """
         now = utcnow()
         with self.transaction() as conn:
+            old = conn.execute(
+                "SELECT batch_id FROM files WHERE file_id=?", (old_file_id,)
+            ).fetchone()
+            batch_id = old["batch_id"] if old is not None else old_file_id
             conn.execute(
-                "INSERT INTO files(file_id, date, path, rows, status, created_at)"
-                " VALUES (?,?,?,?,'active',?)",
-                (new_file_id, date, path, rows, now),
+                "INSERT INTO files(file_id, batch_id, date, path, rows, status, created_at)"
+                " VALUES (?,?,?,?,?,'active',?)",
+                (new_file_id, batch_id, date, path, rows, now),
             )
             conn.execute("UPDATE files SET status='obsolete' WHERE file_id=?", (old_file_id,))
             conn.execute(

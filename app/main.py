@@ -13,7 +13,13 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
 
 from .config import Config
-from .core import ErasureService, NoDataError, RestrictedError
+from .core import (
+    BatchReleaseBlockedError,
+    ErasureService,
+    NoDataError,
+    RestrictedError,
+    UnknownBatchError,
+)
 from .schemas import ErasureRequest
 from .storage import SCHEMA
 
@@ -131,8 +137,9 @@ def create_app(config: Config | None = None) -> FastAPI:
     @app.get("/dates", summary="List all dates present in the lake")
     def list_dates():
         rows = service.store.query(
-            "SELECT date, COUNT(*) AS files, SUM(rows) AS rows FROM files"
-            " WHERE status='active' GROUP BY date ORDER BY date"
+            "SELECT f.date AS date, COUNT(*) AS files, SUM(f.rows) AS rows"
+            " FROM files f JOIN batches b ON b.file_id=f.batch_id"
+            " WHERE f.status='active' AND b.state='active' GROUP BY f.date ORDER BY f.date"
         )
         restricted = service.store.restricted_dates()
         return [
@@ -169,6 +176,34 @@ def create_app(config: Config | None = None) -> FastAPI:
             media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="clicks-{date}.csv"'},
         )
+
+    # ------------------------------------------------------------- batches
+
+    @app.post("/batches/{file_id}/quarantine", summary="Quarantine an uploaded batch")
+    def quarantine_batch(file_id: str):
+        try:
+            return service.quarantine_batch(file_id)
+        except UnknownBatchError as exc:
+            raise HTTPException(404, str(exc))
+
+    @app.post("/batches/{file_id}/release", summary="Release a quarantined batch")
+    def release_batch(file_id: str):
+        try:
+            return service.release_batch(file_id)
+        except UnknownBatchError as exc:
+            raise HTTPException(404, str(exc))
+        except BatchReleaseBlockedError as exc:
+            return JSONResponse(
+                {"detail": str(exc), "file_id": file_id, "blocking_tasks": exc.tasks},
+                status_code=409,
+            )
+
+    @app.get("/batches/{file_id}", summary="Batch status")
+    def batch_status(file_id: str):
+        try:
+            return service.batch_status(file_id)
+        except UnknownBatchError as exc:
+            raise HTTPException(404, str(exc))
 
     # ------------------------------------------------------------- erasure
 

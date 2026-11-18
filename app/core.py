@@ -33,6 +33,25 @@ class NoDataError(Exception):
         super().__init__(f"no data for date {date}")
 
 
+class UnknownBatchError(Exception):
+    def __init__(self, file_id: str):
+        self.file_id = file_id
+        super().__init__(f"unknown batch {file_id}")
+
+
+class BatchReleaseBlockedError(Exception):
+    """Erasure work covering the batch has not completed; releasing it would
+    make erased clicks downloadable again."""
+
+    def __init__(self, file_id: str, tasks: list[str]):
+        self.file_id = file_id
+        self.tasks = tasks
+        super().__init__(
+            f"batch {file_id} cannot be released: erasure work not completed"
+            f" ({', '.join(tasks)})"
+        )
+
+
 class ErasureService:
     """Core of the click lake: ingest, download and GDPR-style erasure.
 
@@ -48,6 +67,9 @@ class ErasureService:
       overlapping erasures of the same files safe.
     * Per-date locks let an in-progress download finish with a consistent
       view while a rewrite of that date is waiting.
+    * Quarantine/release only flip the batch state; because downloads select
+      their file set from the DB while holding the date lock, a request can
+      never observe a partially quarantined or partially released day.
     """
 
     def __init__(self, config: Config):
@@ -127,27 +149,86 @@ class ErasureService:
                     self.config.data_dir, date, filtered
                 )
                 users = set(filtered.column("user_id").to_pylist())
-                self.store.record_upload(file_id, date, rel_path, filtered.num_rows, users)
+                try:
+                    self.store.record_upload(
+                        file_id, date, rel_path, filtered.num_rows, users
+                    )
+                except Exception:
+                    # registration is all-or-nothing: do not leave data on disk
+                    # that the state DB does not know about (and thus never
+                    # serves).  A crash before this point is handled at startup.
+                    storage.delete_file(self.config.data_dir, rel_path)
+                    raise
             return {
                 "blocked": blocked,
                 "stored": filtered.num_rows,
                 "file_id": file_id,
             }
 
+    # ------------------------------------------------------------- batches
+
+    def batch_status(self, file_id: str) -> dict:
+        """Report one upload batch.  ``file_id`` is the id returned by the
+        upload, and it still resolves the batch after erasure has rewritten
+        its file (and even after that file was cleared entirely)."""
+        batch = self.store.get_batch(file_id)
+        if batch is None:
+            raise UnknownBatchError(file_id)
+        row = self.store.query_one(
+            "SELECT COALESCE(SUM(rows),0) AS rows, COUNT(*) AS files"
+            " FROM files WHERE batch_id=? AND status='active'",
+            (file_id,),
+        )
+        return {
+            "file_id": file_id,
+            "date": batch["date"],
+            "state": batch["state"],
+            "status": batch["state"],
+            "quarantined": batch["state"] == "quarantined",
+            "rows": row["rows"],
+            "files": row["files"],
+            "created_at": batch["created_at"],
+            "updated_at": batch["updated_at"],
+            "released_at": batch["released_at"],
+        }
+
+    def quarantine_batch(self, file_id: str) -> dict:
+        """Take a batch out of reporting immediately."""
+        self.batch_status(file_id)  # 404 for unknown ids
+        self.store.quarantine_batch(file_id)
+        return self.batch_status(file_id)
+
+    def release_batch(self, file_id: str) -> dict:
+        """Put a batch back into reporting, unless erasure work that covers
+        it is still unfinished.  A batch whose clicks were erased can never
+        be released: the rows are gone from the surviving file."""
+        self.batch_status(file_id)  # 404 for unknown ids
+        with self.commit_lock:
+            blockers = self.store.release_blockers(file_id)
+            if blockers:
+                raise BatchReleaseBlockedError(file_id, blockers)
+            self.store.release_batch(file_id)
+        return self.batch_status(file_id)
+
     # ------------------------------------------------------------ downloads
 
     def download(self, date: str) -> pa.Table:
-        """Return the day's full contents.
+        """Return the day's contents, excluding quarantined batches.
 
-        Restriction is checked at request time, so previously shared links are
-        blocked as well. The data is read under the date lock before the
-        response starts streaming, which lets an already-started download
-        finish even if a rewrite begins right after.
+        Restriction is checked at request time and again under the date lock,
+        so previously shared links are blocked as well and a request cannot
+        slip past an erasure accepted while it was waiting. The data is read
+        under the date lock before the response starts streaming, which lets
+        an already-started download finish even if a rewrite begins right
+        after.
         """
         if self.store.is_restricted(date):
             raise RestrictedError(date)
         lock = self.date_lock(date)
         with lock:
+            # re-check: an erasure may have been accepted while we waited
+            if self.store.is_restricted(date):
+                raise RestrictedError(date)
             files = self.store.active_files_for_date(date)
             if not files:
                 raise NoDataError(date)
@@ -158,15 +239,41 @@ class ErasureService:
 
     def submit_erasure(self, user_id: str) -> tuple[dict, bool]:
         """Accept an erasure request. Idempotent: a repeated submission for the
-        same user returns the very same task."""
+        same user returns the very same task.
+
+        The files that actually hold the user's rows are identified under the
+        commit lock *and* the date locks, so neither an upload nor a rewrite
+        can slip in between the scan and the task snapshot.  This keeps the
+        task's pending set exact, which is what lets a batch be released as
+        soon as no erasure that really touches it is outstanding.
+
+        Note the scan runs inside ``commit_lock`` while ``erase_file`` takes
+        date locks without it, so acquiring date locks here cannot deadlock
+        against the worker.
+        """
         with self.commit_lock:
             existing = self.store.get_task_by_user(user_id)
             if existing is not None:
                 return self.task_status(existing["task_id"]), False
-            task_id = new_file_id()
-            self.store.accept_task(task_id, user_id)
-            # blocking takes effect immediately, before any background work
-            self.blocked_users.add(user_id)
+            dates = self.store.dates_for_user(user_id)
+            locks = [self.date_lock(d) for d in sorted(dates)]
+            for lock in locks:
+                lock.acquire()
+            try:
+                suspects = []
+                for info in self.store.active_files_in_dates(dates):
+                    ids = storage.read_table(
+                        self.config.data_dir, info["path"], columns=["user_id"]
+                    ).column("user_id")
+                    if user_id in set(ids.to_pylist()):
+                        suspects.append(info["file_id"])
+                task_id = new_file_id()
+                self.store.accept_task(task_id, user_id, suspects)
+                # blocking takes effect immediately, before any background work
+                self.blocked_users.add(user_id)
+            finally:
+                for lock in reversed(locks):
+                    lock.release()
         self.worker.submit(task_id)
         return self.task_status(task_id), True
 

@@ -36,8 +36,11 @@ python -m pytest tests/ -q
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/upload/{date}` | 上传当日点击 CSV（multipart 文件字段 `file`），返回接收/拦截/入库行数 |
-| `GET` | `/dates` | 列出所有日期（文件数、行数、是否受限） |
-| `GET` | `/dates/{date}/download?format=csv\|parquet` | 按日下载；日期受限时返回 `409` |
+| `GET` | `/dates` | 列出所有日期（文件数、行数、是否受限）；隔离批次不计入 |
+| `GET` | `/dates/{date}/download?format=csv\|parquet` | 按日下载（不含隔离批次）；日期受限时返回 `409` |
+| `POST` | `/batches/{file_id}/quarantine` | 隔离某次上传的批次，立即从报表取数中剔除 |
+| `POST` | `/batches/{file_id}/release` | 放行隔离批次；涉及该批的清除未完成时返回 `409` |
+| `GET` | `/batches/{file_id}` | 查询批次状态（`active` / `quarantined`）与当前行数 |
 | `POST` | `/erasure` | 提交清除请求 `{"user_id": "..."}`（幂等，重复提交返回同一任务） |
 | `GET` | `/erasure/{task_id}` | 查询清除进度 |
 | `GET` | `/erasure?user_id=...` | 列出清除任务 |
@@ -55,6 +58,33 @@ curl -X POST -F "file=@clicks.csv" http://localhost:8000/upload/2026-11-01
 
 - `received`：CSV 数据行总数；`invalid`：格式非法被跳过的行数
 - `blocked`：因清除请求被拦截（未写入）的行数；`stored`：实际入库行数
+- `file_id`：本次上传的批次 id（`stored=0` 时为 `null`），后续隔离/放行/查询都用它
+
+### 批次隔离（可疑数据暂停供数）
+
+```bash
+FILE_ID=$(curl -s -X POST -F "file=@clicks.csv" http://localhost:8000/upload/2026-11-01 | jq -r .file_id)
+
+curl -X POST http://localhost:8000/batches/$FILE_ID/quarantine
+# {"file_id":"...","date":"2026-11-01","state":"quarantined","rows":3,"files":1,...}
+
+curl http://localhost:8000/batches/$FILE_ID      # 查询状态
+curl -X POST http://localhost:8000/batches/$FILE_ID/release   # 核实后放行
+```
+
+- **按批隔离**：隔离以 `file_id` 为单位，同一天其他批次照常供数；该批立即从按日下载
+  和 `/dates` 的行数/文件数中消失。整日都被隔离时，该日下载返回 `404`。
+- **已开始的下载可结束**：下载在日期锁内一次性选定文件集合后再读盘，隔离/放行不会让
+  一次进行中的下载看到半隔离的日期；隔离立即对之后发起的请求生效（旧链接同样）。
+- **隔离参与清除**：隔离只影响供数，不影响 erasure；清除仍会重写/删除该批的文件。
+- **file_id 稳定**：清除重写会生成新的文件版本，但版本继承原批次的 `file_id`，因此
+  重写后仍可用上传返回的 `file_id` 查询、放行。若整批数据都被清除，该批行数归零，
+  放行不会恢复已清除的点击（也拿不到数据）。
+- **放行前校验**：若仍有覆盖该批的 erasure 任务未完成（`pending`/`processing`/`failed`），
+  放行返回 `409` 并列出 `blocking_tasks`，隔离保持不变；任务完成后才允许放行。
+  隔离、放行与清除交错时不会短暂泄露数据。
+- **持久化**：批次登记与文件版本登记在同一个 SQLite 事务内完成。登记失败的上传不会
+  被供数，其残余 part 文件在重启时作为孤儿清理；重启后隔离状态与供数结果保持一致。
 
 ### 清除流程
 
@@ -91,10 +121,13 @@ curl http://localhost:8000/erasure/<task_id>
 ```
 data/
   date=2026-11-01/
-    part-<file_id>.parquet      # 每次上传追加一个 part 文件
+    part-<file_id>.parquet      # 每次上传追加一个 part 文件；清除重写生成新版本
 state/
-  erasure.db                    # SQLite：文件清单、任务、限制日期、用户-日期索引
+  erasure.db                    # SQLite：批次、文件版本、任务、限制日期、用户-日期索引
 ```
+
+`batches.file_id` 是上传返回的批次 id；`files.batch_id` 把每个文件版本（含清除重写
+产生的新版本）归属回原批次。旧版本状态库启动时自动迁移（每个历史文件视为一个批次）。
 
 Parquet schema：`user_id: string, page: string, ts: timestamp[us, tz=UTC]`。
 

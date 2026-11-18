@@ -469,3 +469,438 @@ def test_progress_endpoint_reports_counts(tmp_path):
         assert status["restricted_dates"] == []
         assert status["last_error"] is None
         assert client.get("/erasure/does-not-exist").status_code == 404
+
+
+# ------------------------------------------------------- batch quarantine
+
+
+def upload_batch(client: TestClient, date: str, rows) -> str:
+    r = upload(client, date, rows)
+    assert r.status_code == 200, r.text
+    return r.json()["file_id"]
+
+
+def test_quarantine_hides_one_batch_but_same_day_others_are_served(tmp_path):
+    with make_client(tmp_path) as client:
+        suspect = upload_batch(
+            client,
+            "2026-11-01",
+            [
+                ("alice", "/a", "2026-11-01T00:00:00Z"),
+                ("bob", "/b", "2026-11-01T00:01:00Z"),
+            ],
+        )
+        good = upload_batch(
+            client, "2026-11-01", [("carol", "/c", "2026-11-01T01:00:00Z")]
+        )
+        assert upload_batch(
+            client, "2026-11-02", [("dave", "/d", "2026-11-02T00:00:00Z")]
+        )
+
+        r = client.post(f"/batches/{suspect}/quarantine")
+        assert r.status_code == 200, r.text
+        assert r.json()["state"] == "quarantined"
+        assert r.json()["file_id"] == suspect
+        assert r.json()["rows"] == 2
+
+        # the quarantined batch disappears from downloads and /dates row counts
+        assert download_users(client, "2026-11-01") == {"carol"}
+        dates = {d["date"]: d for d in client.get("/dates").json()}
+        assert dates["2026-11-01"] == {
+            "date": "2026-11-01",
+            "files": 1,
+            "rows": 1,
+            "restricted": False,
+        }
+        assert dates["2026-11-02"]["rows"] == 1
+
+        # status resolves by the upload's file_id and survives other uploads
+        status = client.get(f"/batches/{suspect}").json()
+        assert status["state"] == "quarantined"
+        assert status["date"] == "2026-11-01"
+
+        # release puts exactly this batch back
+        r = client.post(f"/batches/{suspect}/release")
+        assert r.status_code == 200, r.text
+        assert r.json()["state"] == "active"
+        assert r.json()["released_at"] is not None
+        assert download_users(client, "2026-11-01") == {"alice", "bob", "carol"}
+        dates = {d["date"]: d for d in client.get("/dates").json()}
+        assert dates["2026-11-01"]["rows"] == 3
+        assert good != suspect
+
+
+def test_quarantine_is_idempotent_and_unknown_batches_are_404(tmp_path):
+    with make_client(tmp_path) as client:
+        file_id = upload_batch(
+            client, "2026-11-01", [("alice", "/a", "2026-11-01T00:00:00Z")]
+        )
+        assert client.post(f"/batches/{file_id}/quarantine").status_code == 200
+        assert client.post(f"/batches/{file_id}/quarantine").status_code == 200
+        assert client.post(f"/batches/{file_id}/release").status_code == 200
+        assert client.post(f"/batches/{file_id}/release").status_code == 200
+
+        assert client.get("/batches/nope").status_code == 404
+        assert client.post("/batches/nope/quarantine").status_code == 404
+        assert client.post("/batches/nope/release").status_code == 404
+
+
+def test_fully_quarantined_date_has_no_download(tmp_path):
+    with make_client(tmp_path) as client:
+        file_id = upload_batch(
+            client, "2026-11-01", [("alice", "/a", "2026-11-01T00:00:00Z")]
+        )
+        client.post(f"/batches/{file_id}/quarantine")
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+        assert client.get("/dates").json() == []
+        client.post(f"/batches/{file_id}/release")
+        assert download_users(client, "2026-11-01") == {"alice"}
+
+
+def test_started_download_finishes_after_quarantine(tmp_path, monkeypatch):
+    """Quarantine only affects requests that have not selected their files yet;
+    a download that already started may finish."""
+    with make_client(tmp_path) as client:
+        file_id = upload_batch(
+            client, "2026-11-01", [("alice", "/a", "2026-11-01T00:00:00Z")]
+        )
+        service = client.app.state.service
+        real_read = storage.read_table
+        entered = threading.Event()
+        gate = threading.Event()
+
+        def blocked_read(data_dir, rel_path, columns=None):
+            entered.set()
+            assert gate.wait(10)
+            return real_read(data_dir, rel_path, columns)
+
+        monkeypatch.setattr(storage, "read_table", blocked_read)
+        result: dict = {}
+
+        def run_download():
+            result["table"] = service.download("2026-11-01")
+
+        thread = threading.Thread(target=run_download)
+        thread.start()
+        assert entered.wait(10)
+        # the download already holds its file selection; quarantine now
+        assert client.post(f"/batches/{file_id}/quarantine").status_code == 200
+        gate.set()
+        thread.join(10)
+        assert not thread.is_alive()
+
+        readers = result["table"].column("user_id").to_pylist()
+        assert readers == ["alice"]  # in-flight download completed normally
+        # but subsequent downloads no longer see it
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+
+
+def test_quarantined_batch_is_still_erased_and_file_id_survives_rewrite(tmp_path):
+    with make_client(tmp_path) as client:
+        suspect = upload_batch(
+            client,
+            "2026-11-01",
+            [
+                ("alice", "/a", "2026-11-01T00:00:00Z"),
+                ("bob", "/b", "2026-11-01T00:01:00Z"),
+            ],
+        )
+        client.post(f"/batches/{suspect}/quarantine")
+
+        # quarantine does not prevent the erasure from rewriting the file
+        task_id = client.post("/erasure", json={"user_id": "alice"}).json()["task_id"]
+        wait_task(client, task_id)
+
+        # the original upload id still resolves the batch and its rewritten file
+        status = client.get(f"/batches/{suspect}").json()
+        assert status["state"] == "quarantined"
+        assert status["rows"] == 1
+        assert status["files"] == 1
+        # still quarantined, so it is not served at all
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+
+        # release makes the surviving batch downloadable, but never alice again
+        assert client.post(f"/batches/{suspect}/release").status_code == 200
+        users = download_users(client, "2026-11-01")
+        assert "alice" not in users
+        assert users == {"bob"}
+
+
+def test_erasing_a_fully_quarantined_batch_leaves_nothing_to_release(tmp_path):
+    with make_client(tmp_path) as client:
+        suspect = upload_batch(
+            client, "2026-11-01", [("alice", "/a", "2026-11-01T00:00:00Z")]
+        )
+        client.post(f"/batches/{suspect}/quarantine")
+        task_id = client.post("/erasure", json={"user_id": "alice"}).json()["task_id"]
+        wait_task(client, task_id)
+
+        status = client.get(f"/batches/{suspect}").json()
+        assert status["state"] == "quarantined"
+        assert (status["rows"], status["files"]) == (0, 0)
+
+        # releasing cannot bring the erased clicks back
+        assert client.post(f"/batches/{suspect}/release").status_code == 200
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+        assert client.get("/dates").json() == []
+
+
+def test_release_allowed_for_same_day_batch_outside_the_erasure(tmp_path):
+    with make_client(tmp_path) as client:
+        suspect = upload_batch(
+            client,
+            "2026-11-01",
+            [
+                ("alice", "/a", "2026-11-01T00:00:00Z"),
+                ("carol", "/c", "2026-11-01T00:01:00Z"),
+            ],
+        )
+        other = upload_batch(
+            client, "2026-11-01", [("bob", "/b", "2026-11-01T01:00:00Z")]
+        )
+        client.post(f"/batches/{other}/quarantine")
+
+        service = client.app.state.service
+        gate = threading.Event()
+        original_erase = service.erase_file
+
+        def slow_erase(task, file_id):
+            gate.wait(10)
+            return original_erase(task, file_id)
+
+        service.erase_file = slow_erase
+        try:
+            task_id = client.post(
+                "/erasure", json={"user_id": "alice"}
+            ).json()["task_id"]
+            wait_status(client, task_id, "processing")
+
+            # bob's batch has nothing to do with alice's erasure: release is fine
+            assert client.post(f"/batches/{other}/release").status_code == 200
+            # the batch that holds alice's clicks stays refused
+            r = client.post(f"/batches/{suspect}/release")
+            assert r.status_code == 409
+        finally:
+            gate.set()
+            service.erase_file = original_erase
+        wait_task(client, task_id)
+
+
+def test_release_refused_while_erasure_processing_and_quarantine_kept(tmp_path):
+    with make_client(tmp_path) as client:
+        suspect = upload_batch(
+            client,
+            "2026-11-01",
+            [
+                ("alice", "/a", "2026-11-01T00:00:00Z"),
+                ("bob", "/b", "2026-11-01T00:01:00Z"),
+            ],
+        )
+        client.post(f"/batches/{suspect}/quarantine")
+
+        service = client.app.state.service
+        gate = threading.Event()
+        original_erase = service.erase_file
+
+        def slow_erase(task, file_id):
+            gate.wait(10)
+            return original_erase(task, file_id)
+
+        service.erase_file = slow_erase
+        try:
+            task_id = client.post(
+                "/erasure", json={"user_id": "alice"}
+            ).json()["task_id"]
+            wait_status(client, task_id, "processing")
+
+            # not completed yet: refusing keeps the batch quarantined
+            r = client.post(f"/batches/{suspect}/release")
+            assert r.status_code == 409, r.text
+            assert task_id in r.json()["blocking_tasks"]
+            assert client.get(f"/batches/{suspect}").json()["state"] == "quarantined"
+            # the erasure restriction also prevents serving the date meanwhile
+            assert client.get("/dates/2026-11-01/download").status_code == 409
+        finally:
+            gate.set()
+            service.erase_file = original_erase
+
+        wait_task(client, task_id)
+        # after completion release is allowed and does not resurrect alice
+        assert client.post(f"/batches/{suspect}/release").status_code == 200
+        assert download_users(client, "2026-11-01") == {"bob"}
+
+
+def test_release_refused_while_erasure_failed_keeps_quarantine(tmp_path, monkeypatch):
+    with make_client(tmp_path) as client:
+        suspect = upload_batch(
+            client,
+            "2026-11-01",
+            [
+                ("alice", "/a", "2026-11-01T00:00:00Z"),
+                ("bob", "/b", "2026-11-01T00:01:00Z"),
+            ],
+        )
+        client.post(f"/batches/{suspect}/quarantine")
+
+        def always_fail(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(storage, "write_table_atomic", always_fail)
+        task_id = client.post("/erasure", json={"user_id": "alice"}).json()["task_id"]
+        wait_status(client, task_id, "failed")
+
+        r = client.post(f"/batches/{suspect}/release")
+        assert r.status_code == 409
+        assert client.get(f"/batches/{suspect}").json()["state"] == "quarantined"
+        # quarantine and erasure restriction both keep the data from being served
+        assert client.get("/dates/2026-11-01/download").status_code == 409
+        monkeypatch.undo()
+        wait_task(client, task_id)
+        # quarantine still holds; release afterwards never resurrects alice
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+        assert client.post(f"/batches/{suspect}/release").status_code == 200
+        assert download_users(client, "2026-11-01") == {"bob"}
+
+
+def test_quarantine_and_registration_survive_restart(tmp_path):
+    config = make_config(tmp_path)
+    app1 = create_app(config)
+    with TestClient(app1) as client:
+        suspect = upload_batch(
+            client,
+            "2026-11-01",
+            [
+                ("alice", "/a", "2026-11-01T00:00:00Z"),
+                ("bob", "/b", "2026-11-01T00:01:00Z"),
+            ],
+        )
+        upload_batch(client, "2026-11-01", [("carol", "/c", "2026-11-01T01:00:00Z")])
+        client.post(f"/batches/{suspect}/quarantine")
+
+    app2 = create_app(config)
+    with TestClient(app2) as client2:
+        status = client2.get(f"/batches/{suspect}").json()
+        assert status["state"] == "quarantined"
+        assert status["rows"] == 2
+        assert download_users(client2, "2026-11-01") == {"carol"}
+        dates = {d["date"]: d for d in client2.get("/dates").json()}
+        assert dates["2026-11-01"]["rows"] == 1
+        # release still addresses the same batch after restart
+        assert client2.post(f"/batches/{suspect}/release").status_code == 200
+        assert download_users(client2, "2026-11-01") == {"alice", "bob", "carol"}
+
+
+def test_failed_registration_is_not_served_and_is_cleaned_on_restart(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    app1 = create_app(config)
+    with TestClient(app1) as client:
+        service = client.app.state.service
+
+        def broken_record_upload(*args, **kwargs):
+            raise RuntimeError("state write failed")
+
+        monkeypatch.setattr(service.store, "record_upload", broken_record_upload)
+        with pytest.raises(RuntimeError):
+            upload(
+                client,
+                "2026-11-01",
+                [("alice", "/a", "2026-11-01T00:00:00Z")],
+            )
+        assert client.get("/dates").json() == []
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+        # the failed registration leaves no live data behind either
+        on_disk = list((tmp_path / "data").rglob("part-*.parquet"))
+        assert on_disk == []
+
+    monkeypatch.undo()
+    app2 = create_app(config)
+    with TestClient(app2) as client2:
+        # the unregistered file must not leak into the lake after a restart
+        assert client2.get("/dates").json() == []
+        assert client2.get("/dates/2026-11-01/download").status_code == 404
+        on_disk = list((tmp_path / "data").rglob("part-*.parquet"))
+        assert on_disk == []
+
+
+
+OLD_SCHEMA = """
+CREATE TABLE files (
+    file_id    TEXT PRIMARY KEY,
+    date       TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    rows       INTEGER NOT NULL,
+    status     TEXT NOT NULL CHECK (status IN ('active', 'obsolete', 'deleted')),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX idx_files_date ON files(date, status);
+CREATE TABLE user_dates (
+    user_id TEXT NOT NULL,
+    date    TEXT NOT NULL,
+    PRIMARY KEY (user_id, date)
+);
+CREATE TABLE erasure_tasks (
+    task_id    TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL UNIQUE,
+    status     TEXT NOT NULL CHECK (status IN ('pending', 'processing', 'failed', 'completed')),
+    attempts   INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE erasure_files (
+    task_id TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    status  TEXT NOT NULL CHECK (status IN ('pending', 'done')),
+    PRIMARY KEY (task_id, file_id)
+);
+CREATE TABLE restricted_dates (
+    date    TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    PRIMARY KEY (date, task_id)
+);
+"""
+
+
+def test_legacy_state_db_is_migrated_and_batches_work(tmp_path):
+    """State created before batch isolation must keep serving and become
+    addressable by file id after upgrade."""
+    import sqlite3
+
+    config = make_config(tmp_path)
+    config.state_dir.mkdir(parents=True)
+    file_id, rel_path = storage.write_table_atomic(
+        config.data_dir,
+        "2026-11-01",
+        storage.pa.table(
+            {
+                "user_id": ["alice", "bob"],
+                "page": ["/a", "/b"],
+                "ts": storage.pa.array(
+                    [0, 1], type=storage.pa.timestamp("us", tz="UTC")
+                ),
+            },
+            schema=storage.SCHEMA,
+        ),
+    )
+    conn = sqlite3.connect(str(config.db_path))
+    conn.executescript(OLD_SCHEMA)
+    conn.execute(
+        "INSERT INTO files VALUES (?,?,?,?,'active',?)",
+        (file_id, "2026-11-01", rel_path, 2, "2026-11-01T00:00:00+00:00"),
+    )
+    conn.executemany(
+        "INSERT INTO user_dates VALUES (?,?)",
+        [("alice", "2026-11-01"), ("bob", "2026-11-01")],
+    )
+    conn.commit()
+    conn.close()
+
+    with TestClient(create_app(config)) as client:
+        assert download_users(client, "2026-11-01") == {"alice", "bob"}
+        status = client.get(f"/batches/{file_id}").json()
+        assert status["state"] == "active"
+        assert status["rows"] == 2
+        assert client.post(f"/batches/{file_id}/quarantine").status_code == 200
+        assert client.get("/dates/2026-11-01/download").status_code == 404
+        assert client.post(f"/batches/{file_id}/release").status_code == 200
+        assert download_users(client, "2026-11-01") == {"alice", "bob"}
